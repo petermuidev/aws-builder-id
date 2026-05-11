@@ -1,220 +1,194 @@
 """
 邮箱服务模块
-基于 cloudflare_temp_email 项目实现临时邮箱功能
+适配 generator.email (替代 cloudflare_temp_email)
 """
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import json
 import random
+import re
 import string
 import time
-import email
-from email import policy
+from typing import Optional
+
+import requests as http_requests
+from lxml import html as lxml_html
 
 from config import (
-    EMAIL_WORKER_URL,
     EMAIL_DOMAIN,
     EMAIL_PREFIX_LENGTH,
     EMAIL_WAIT_TIMEOUT,
     EMAIL_POLL_INTERVAL,
-    HTTP_TIMEOUT
+    HTTP_TIMEOUT,
 )
 from helpers.utils import http_session, get_user_agent, extract_verification_code
+
+GENERATOR_EMAIL_URL = "https://generator.email"
+
+TEMP_EMAIL_DOMAINS = [
+    "fundproceed.com",
+    "careandvital.com",
+    "btcmod.com",
+    "getcode1.com",
+    "speeddataanalytics.com",
+    "sedekah-mudah.com",
+    "capcutpro.click",
+]
+
+_session = None
+
+
+def _get_session():
+    global _session
+    if _session is None:
+        _session = http_requests.Session()
+        _session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            }
+        )
+    return _session
 
 
 def create_temp_email():
     """
-    创建临时邮箱
-    返回: (邮箱地址, JWT令牌)，失败返回 (None, None)
+    创建临时邮箱 (使用 generator.email)
+    返回: (邮箱地址, token_dict_json)，失败返回 (None, None)
     """
     print("正在创建临时邮箱...")
 
-    prefix = ''.join(random.choices(
-        string.ascii_lowercase + string.digits,
-        k=EMAIL_PREFIX_LENGTH
-    ))
+    prefix = "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=EMAIL_PREFIX_LENGTH)
+    )
 
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": get_user_agent()
-    }
+    if EMAIL_DOMAIN in ("your-domain.com", ""):
+        domain = random.choice(TEMP_EMAIL_DOMAINS)
+    else:
+        domain = EMAIL_DOMAIN
 
-    try:
-        response = http_session.post(
-            f"{EMAIL_WORKER_URL}/api/new_address",
-            headers=headers,
-            json={"name": prefix},
-            timeout=HTTP_TIMEOUT
-        )
+    email_address = f"{prefix}@{domain}"
+    token = json.dumps({"username": prefix, "domain": domain})
 
-        if response.status_code == 200:
-            result = response.json()
-            jwt_token = result.get('jwt')
-            actual_email = result.get('address')
-
-            if jwt_token and actual_email:
-                print(f"邮箱创建成功: {actual_email}")
-                return actual_email, jwt_token
-            elif jwt_token:
-                fallback_email = f"tmp{prefix}@{EMAIL_DOMAIN}"
-                print(f"邮箱创建成功: {fallback_email}")
-                return fallback_email, jwt_token
-        else:
-            print(f"API 错误: HTTP {response.status_code}")
-
-    except Exception as e:
-        print(f"创建邮箱失败: {e}")
-
-    return None, None
+    print(f"邮箱创建成功: {email_address}")
+    return email_address, token
 
 
-def fetch_emails(jwt_token: str):
-    """获取邮件列表"""
-    headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "User-Agent": get_user_agent()
-    }
-    
-    try:
-        response = http_session.get(
-            f"{EMAIL_WORKER_URL}/api/mails?limit=20&offset=0",
-            headers=headers,
-            timeout=HTTP_TIMEOUT
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            if isinstance(result, list):
-                return result
-            elif isinstance(result, dict):
-                return result.get('results', result.get('mails', []))
-                
-    except Exception as e:
-        print(f"  获取邮件错误: {e}")
-    
+def _fetch_mailbox_page(username: str, domain: str) -> Optional[str]:
+    sess = _get_session()
+    url = f"{GENERATOR_EMAIL_URL}/{domain}/{username}"
+    for attempt in range(3):
+        try:
+            resp = sess.get(url, timeout=15, headers={"Connection": "close"})
+            if resp.status_code == 200:
+                return resp.text
+        except Exception:
+            time.sleep(2)
     return None
 
 
-def get_email_detail(jwt_token: str, email_id: str):
-    """获取邮件详情"""
-    headers = {
-        "Authorization": f"Bearer {jwt_token}",
-        "User-Agent": get_user_agent()
-    }
-    
+def _parse_email_body(email_url: str) -> str:
+    sess = _get_session()
     try:
-        response = http_session.get(
-            f"{EMAIL_WORKER_URL}/api/mails/{email_id}",
-            headers=headers,
-            timeout=HTTP_TIMEOUT
-        )
-        
-        if response.status_code == 200:
-            return response.json()
-            
+        resp = sess.get(email_url, timeout=15)
+        if resp.status_code == 200:
+            tree = lxml_html.fromstring(resp.text)
+            body_parts = tree.xpath(
+                '//div[contains(@class, "e7m")]//text() | //td//text() | //p//text()'
+            )
+            return " ".join(t.strip() for t in body_parts if t.strip())
     except Exception as e:
-        print(f"  获取邮件详情错误: {e}")
-    
+        print(f"  读取邮件内容错误: {e}")
+    return ""
+
+
+def _extract_aws_code(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for pattern in [
+        r"\b(\d{6})\b",
+        r"code[:\s]+(\d{6})",
+        r"Code[:\s]+(\d{6})",
+        r"verification[:\s]+(\d{6})",
+        r"VERIFICATION\s+CODE[:\s]+(\d{6})",
+    ]:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
     return None
 
 
-def parse_raw_email(raw_content: str):
-    """解析原始邮件内容"""
-    result = {'subject': '', 'body': '', 'sender': ''}
-    
-    if not raw_content:
-        return result
-    
-    try:
-        msg = email.message_from_string(raw_content, policy=policy.default)
-        result['subject'] = msg.get('Subject', '')
-        result['sender'] = msg.get('From', '')
-        
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                if content_type in ['text/plain', 'text/html']:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        result['body'] = payload.decode('utf-8', errors='ignore')
-                        break
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                result['body'] = payload.decode('utf-8', errors='ignore')
-    except Exception as e:
-        print(f"  解析邮件错误: {e}")
-    
-    return result
-
-
-def wait_for_verification_email(jwt_token: str, timeout: int = None):
+def wait_for_verification_email(token_str: str, timeout: int = None):
     """
-    等待并提取验证码
+    等待并提取验证码 (从 generator.email 页面轮询)
     返回: 验证码字符串，未找到返回 None
     """
     if timeout is None:
         timeout = EMAIL_WAIT_TIMEOUT
-    
+
+    try:
+        token_data = json.loads(token_str)
+        username = token_data["username"]
+        domain = token_data["domain"]
+    except (json.JSONDecodeError, KeyError):
+        print("  token 格式无效，无法读取邮箱")
+        return None
+
     print(f"正在等待验证邮件（最长 {timeout} 秒）...")
     start_time = time.time()
-    
+    seen_links = set()
+
     while time.time() - start_time < timeout:
-        emails = fetch_emails(jwt_token)
-        
-        if emails and len(emails) > 0:
-            for email_item in emails:
-                raw_content = email_item.get('raw', '')
-                if raw_content:
-                    parsed = parse_raw_email(raw_content)
-                    subject = parsed['subject']
-                    sender = parsed['sender'].lower()
-                    body = parsed['body']
+        page_html = _fetch_mailbox_page(username, domain)
+        if page_html is None:
+            time.sleep(EMAIL_POLL_INTERVAL)
+            continue
+
+        tree = lxml_html.fromstring(page_html)
+
+        links = tree.xpath('//a[contains(@id, "iddelet")]')
+        for link in links:
+            href = link.get("href", "")
+            link_text = link.text_content().strip()
+
+            if href in seen_links:
+                continue
+            seen_links.add(href)
+
+            combined = (link_text + " " + href).lower()
+            if any(
+                kw in combined
+                for kw in ("amazon", "aws", "builder", "verification", "verify", "code")
+            ):
+                print(f"\n收到可能的验证邮件: {link_text[:80]}")
+
+                if href.startswith("http"):
+                    email_url = href
                 else:
-                    sender = str(email_item.get('from') or email_item.get('source', '')).lower()
-                    subject = email_item.get('subject', '') or ''
-                    body = ''
-                
-                # 判断是否为 AWS 验证邮件
-                if 'amazon' in sender or 'aws' in sender or 'verify' in subject.lower():
-                    print(f"\n收到验证邮件!")
-                    print(f"   主题: {subject}")
-                    
-                    code = extract_verification_code(subject)
-                    if code:
-                        return code
-                    
-                    if body:
-                        code = extract_verification_code(body)
-                        if code:
-                            return code
-                    
-                    email_id = email_item.get('id')
-                    if email_id:
-                        detail = get_email_detail(jwt_token, email_id)
-                        if detail:
-                            detail_raw = detail.get('raw', '')
-                            if detail_raw:
-                                parsed_detail = parse_raw_email(detail_raw)
-                                code = extract_verification_code(parsed_detail['body'])
-                                if code:
-                                    return code
-                            
-                            content = (
-                                detail.get('html') or 
-                                detail.get('text') or 
-                                detail.get('content', '')
-                            )
-                            if content:
-                                code = extract_verification_code(content)
-                                if code:
-                                    return code
-        
+                    email_url = f"{GENERATOR_EMAIL_URL}{href}"
+
+                body_text = _parse_email_body(email_url)
+                code = _extract_aws_code(link_text)
+                if not code and body_text:
+                    code = _extract_aws_code(body_text)
+
+                if code:
+                    print(f"   验证码: {code}")
+                    return code
+
+        full_text = " ".join(t.strip() for t in tree.xpath("//text()") if t.strip())
+        code = _extract_aws_code(full_text)
+        if code:
+            print(f"\n   在邮箱主页找到验证码: {code}")
+            return code
+
         elapsed = int(time.time() - start_time)
-        print(f"  等待中... ({elapsed}秒)", end='\r')
+        print(f"  等待中... ({elapsed}秒)", end="\r")
         time.sleep(EMAIL_POLL_INTERVAL)
-    
+
     print("\n等待验证邮件超时")
     return None

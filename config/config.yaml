@@ -1,26 +1,26 @@
-# 邮箱服务配置
+# 邮箱服务配置 (generator.email)
 email:
-  # 你部署的 cloudflare_temp_email Worker 服务地址
-  worker_url: "https://your-worker.workers.dev"
+  # generator.email 域名（无需部署，留空则自动选择）
+  worker_url: "https://generator.email"
 
-  # 邮箱域名（你在 Cloudflare Email Routing 中配置的收信域名）
-  domain: "your-domain.com"
+  # 邮箱域名（留空则随机使用 generator.email 可用域名）
+  domain: ""
 
   # 生成的随机邮箱前缀长度
   prefix_length: 10
 
   # 等待验证邮件的超时时间（秒）
-  wait_timeout: 120
+  wait_timeout: 180
 
   # 轮询邮件的间隔时间（秒）
-  poll_interval: 3
+  poll_interval: 5
 
-  # 管理员密码（用于管理员 API）
-  admin_password: "your-admin-password"
+  # 管理员密码（已弃用）
+  admin_password: ""
 
 # 浏览器配置
 browser:
-  headless: false      # 是否无头模式
+  headless: true       # 是否无头模式
   slow_mo: 100         # 操作延迟（毫秒）
 
 # 地区环境配置
@@ -34,7 +34,7 @@ region:
   
   # 代理配置
   # 是否使用代理
-  use_proxy: true
+  use_proxy: false
   
   # 代理模式: static (静态代理) 或 dynamic (动态API)
   proxy_mode: "dynamic"  # 可选: static, dynamic
