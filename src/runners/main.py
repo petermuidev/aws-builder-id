@@ -31,7 +31,7 @@ def generate_strong_password():
     return password
 
 
-def save_account(email, password, name, jwt_token=""):
+def save_account(email, password, name, jwt_token="", tokens=None):
     account_info = {
         "email": email,
         "password": password,
@@ -40,6 +40,8 @@ def save_account(email, password, name, jwt_token=""):
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "status": "registered",
     }
+    if tokens:
+        account_info["tokens"] = tokens
     file_path = "accounts.jsonl"
     try:
         with open(file_path, "a", encoding="utf-8") as f:
@@ -162,8 +164,25 @@ def run(fixed_account=None):
         signup_btn = page.locator("button:has-text('Sign up with Builder ID')")
         signup_btn.wait_for(state="visible", timeout=15000)
         signup_btn.click()
-        human_delay(3, 5)
+        # Wait for SPA transition to signin.aws domain
+        try:
+            page.wait_for_url("**/signin.aws/**", timeout=15000)
+        except Exception:
+            human_delay(5, 8)
         print(f"After signup click - URL: {page.url}")
+        # Check for captcha after signup button
+        for cap_name, cap_sel in {"aws_waf": "#aws-waf-captcha", "turnstile": ".cf-turnstile", "recaptcha": ".g-recaptcha", "iframe_captcha": "iframe[src*='captcha']"}.items():
+            try:
+                if page.locator(cap_sel).is_visible(timeout=3000):
+                    print(f"  CAPTCHA detected: {cap_name}")
+                    page.screenshot(path="screenshot_captcha.png")
+                    save_account(email_address, "CAPTCHA_BLOCKED", random_name or "", jwt_token)
+                    print("  Signup blocked by captcha — cannot proceed automatically")
+                    if page:
+                        page.close()
+                    return
+            except Exception:
+                pass
         page.screenshot(path="screenshot.png")
         print("Screenshot saved (signup page)")
 
@@ -188,6 +207,11 @@ def run(fixed_account=None):
         continue_btn.click()
 
         human_delay(3, 5)
+        # Wait for transition to profile.aws.amazon.com (name form)
+        try:
+            page.wait_for_url("**/profile.aws.amazon.com/**", timeout=15000)
+        except Exception:
+            pass
         print(f"Current URL: {page.url}")
         page.screenshot(path="screenshot.png")
 
@@ -233,12 +257,18 @@ def run(fixed_account=None):
                     print(f"  Clicked: {sel}")
                     break
 
-            human_delay(5, 8)
-            if "verification" in page.url.lower() or "signup" in page.url.lower():
-                print(f"  Advanced to {page.url[:80]}")
+            # Wait for verification page (enter-email URL fragment)
+            try:
+                page.wait_for_url("**/enter-email**", timeout=15000)
+                print(f"  Advanced to verification page: {page.url[:80]}")
                 break
-            if attempt < 2:
-                print(f"  Retrying ({attempt + 2}/3)...")
+            except Exception:
+                human_delay(5, 8)
+                if "verification" in page.url.lower() or "signup" in page.url.lower() or "enter-email" in page.url.lower():
+                    print(f"  Advanced to {page.url[:80]}")
+                    break
+                if attempt < 2:
+                    print(f"  Retrying ({attempt + 2}/3)...")
 
         page.screenshot(path="screenshot.png")
 
@@ -266,8 +296,15 @@ def run(fixed_account=None):
                 human_delay(4, 6)
 
                 code_input = page.locator(
-                    'input[placeholder*="digit"], input[type="text"]'
+                    'input[placeholder="6-digit"]'
                 ).first
+                try:
+                    code_input.wait_for(state="visible", timeout=10000)
+                except Exception:
+                    # Fallback to generic selectors
+                    code_input = page.locator(
+                        'input[placeholder*="digit"], input[type="text"]'
+                    ).first
                 code_input.wait_for(state="visible", timeout=15000)
                 human_delay(1, 2)
                 code_input.click()
@@ -389,7 +426,25 @@ def run(fixed_account=None):
         print(f"Final URL: {page.url}")
         page.screenshot(path="final_success.png")
 
-        save_account(email_address, password, random_name, jwt_token)
+        # Extract auth tokens from cookies and localStorage
+        tokens = {}
+        try:
+            for cookie in page.context.cookies():
+                name = cookie.get("name", "")
+                if any(kw in name.lower() for kw in ("token", "auth", "session", "jwt", "id_token", "access_token", "cognito")):
+                    tokens[f"cookie:{name}"] = cookie.get("value", "")[:80]
+            for key in page.evaluate("() => Object.keys(window.localStorage)"):
+                val = page.evaluate(f"() => window.localStorage.getItem('{key}')")
+                if val and any(kw in key.lower() for kw in ("token", "auth", "session", "cognito")):
+                    tokens[f"localStorage:{key}"] = str(val)[:80]
+            if tokens:
+                print(f"  Tokens extracted: {list(tokens.keys())}")
+            else:
+                print("  No auth tokens found in cookies/localStorage")
+        except Exception as e:
+            print(f"  Token extraction error: {e}")
+
+        save_account(email_address, password, random_name, jwt_token, tokens)
         print("\nAccount flow completed, saved to accounts.jsonl")
 
     except Exception as e:
